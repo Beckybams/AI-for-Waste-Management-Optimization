@@ -1,0 +1,251 @@
+"""
+AI-for-Waste-Management-Optimization (single-file)
+Generates synthetic data, trains a waste-volume predictor, clusters locations
+into collection zones and creates simple routes per zone.
+
+Dependencies:
+  pip install numpy pandas scikit-learn matplotlib joblib
+
+Run:
+  python ai_waste_management.py
+"""
+
+import json
+import os
+from math import sqrt
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split, RandomizedSearchCV
+from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.cluster import KMeans
+import matplotlib.pyplot as plt
+from sklearn.neighbors import NearestNeighbors
+import joblib
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+
+RANDOM_STATE = 42
+OUT_DIR = "output_ai_waste"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+
+def generate_synthetic_data(n=1200, random_state=RANDOM_STATE):
+    """Generate synthetic dataset for waste generation (kg/week)."""
+    np.random.seed(random_state)
+    # geographic bounding box (example city)
+    lats = np.random.uniform(6.4, 6.6, size=n)
+    lons = np.random.uniform(3.2, 3.6, size=n)
+
+    household_count = np.random.poisson(lam=50, size=n) + 1
+    population_density = np.clip(np.random.normal(loc=3000, scale=800, size=n), 200, 10000)
+    avg_income = np.clip(np.random.normal(loc=1500, scale=600, size=n), 200, 10000)  # local currency/month
+    temperature = np.clip(np.random.normal(loc=28, scale=3, size=n), 18, 40)  # deg C
+    day_of_week = np.random.randint(0, 7, size=n)
+    is_holiday = (np.random.rand(n) < 0.05).astype(int)
+    industrial_prop = np.clip(np.random.beta(a=2, b=8, size=n), 0, 1)
+    recycling_rate = np.clip(np.random.beta(a=2, b=5, size=n), 0, 1)
+
+    # core waste-generation model (kg/week) + noise
+    base = 0.05 * household_count \
+           + 0.002 * population_density \
+           + 0.0005 * avg_income \
+           + 8.0 * industrial_prop \
+           - 10.0 * recycling_rate \
+           + 2.0 * (day_of_week >= 5).astype(float)
+    temp_effect = 0.1 * (temperature - temperature.mean())
+    noise = np.random.normal(scale=5.0, size=n)
+
+    waste_volume = np.clip(base + temp_effect + noise + 20, 0.5, None)
+
+    df = pd.DataFrame({
+        "lat": lats,
+        "lon": lons,
+        "household_count": household_count,
+        "population_density": population_density,
+        "avg_income": avg_income,
+        "temperature": temperature,
+        "day_of_week": day_of_week,
+        "is_holiday": is_holiday,
+        "industrial_prop": industrial_prop,
+        "recycling_rate": recycling_rate,
+        "waste_volume_kg_per_week": waste_volume
+    })
+
+    return df
+
+
+def train_model(X_train, y_train, tune=False, random_state=RANDOM_STATE):
+    """Train RandomForestRegressor. If tune=True performs a small RandomizedSearchCV."""
+    if not tune:
+        model = RandomForestRegressor(n_estimators=150, random_state=random_state)
+        model.fit(X_train, y_train)
+        return model
+
+    # small randomized search space
+    param_dist = {
+        "n_estimators": [100, 150, 200],
+        "max_depth": [None, 8, 12, 20],
+        "min_samples_split": [2, 4, 8],
+        "min_samples_leaf": [1, 2, 4]
+    }
+    base = RandomForestRegressor(random_state=random_state)
+    rsearch = RandomizedSearchCV(
+        base, param_distributions=param_dist,
+        n_iter=12, cv=3, verbose=1, n_jobs=-1, random_state=random_state
+    )
+    rsearch.fit(X_train, y_train)
+    print("Best params (RandomizedSearchCV):", rsearch.best_params_)
+    return rsearch.best_estimator_
+
+
+def evaluate_model(model, X_test, y_test):
+    y_pred = model.predict(X_test)
+    rmse = mean_squared_error(y_test, y_pred, squared=False)
+    r2 = r2_score(y_test, y_pred)
+    return {"rmse": rmse, "r2": r2, "y_pred": y_pred}
+
+
+def cluster_locations(df, n_clusters=8, random_state=RANDOM_STATE):
+    coords = df[["lat", "lon"]].values
+    kmeans = KMeans(n_clusters=n_clusters, random_state=random_state, n_init=10)
+    df["cluster"] = kmeans.fit_predict(coords)
+    centroids = kmeans.cluster_centers_
+    return df, centroids
+
+
+def greedy_nearest_neighbor_route(coords):
+    """
+    Simple route (list of indices) using nearest neighbor heuristic.
+    coords: array-like shape (m,2) containing [lat, lon]
+    """
+    if len(coords) == 0:
+        return []
+
+    visited = [0]
+    remaining = set(range(1, len(coords)))
+    while remaining:
+        last = visited[-1]
+        # compute squared euclidean distances for speed
+        dists = {i: (coords[last, 0]-coords[i, 0])**2 + (coords[last, 1]-coords[i, 1])**2 for i in remaining}
+        next_idx = min(dists, key=dists.get)
+        visited.append(next_idx)
+        remaining.remove(next_idx)
+    return visited
+
+
+def create_routes_per_cluster(df, cluster_col="cluster", take_top_n_per_cluster=None):
+    """For each cluster, compute a greedy route order using nearest neighbor heuristic."""
+    routes = {}
+    for c in sorted(df[cluster_col].unique()):
+        sub = df[df[cluster_col] == c].reset_index(drop=True)
+        coords = sub[["lat", "lon"]].to_numpy()
+        if len(coords) == 0:
+            routes[int(c)] = []
+            continue
+        order = greedy_nearest_neighbor_route(coords)
+        route_list = []
+        for idx in order:
+            item = {
+                "lat": float(sub.loc[idx, "lat"]),
+                "lon": float(sub.loc[idx, "lon"]),
+                "waste_volume_kg_per_week": float(sub.loc[idx, "waste_volume_kg_per_week"])
+            }
+            route_list.append(item)
+        if take_top_n_per_cluster is not None:
+            route_list = route_list[:take_top_n_per_cluster]
+        routes[int(c)] = route_list
+    return routes
+
+
+def plot_clusters(df, centroids=None, save_path=None):
+    plt.figure(figsize=(8, 6))
+    sc = plt.scatter(df["lon"], df["lat"], s=np.clip(df["waste_volume_kg_per_week"], 5, 50),
+                     c=df["cluster"], cmap="tab10", alpha=0.8)
+    if centroids is not None:
+        plt.scatter(centroids[:, 1], centroids[:, 0], marker="X", s=120, c="k", label="centroid")
+    plt.xlabel("Longitude")
+    plt.ylabel("Latitude")
+    plt.title("Synthetic locations colored by cluster (marker size ~ waste volume)")
+    plt.grid(True)
+    if save_path:
+        plt.savefig(save_path, bbox_inches="tight")
+    plt.show()
+
+
+def plot_actual_vs_pred(actual, pred, save_path=None):
+    plt.figure(figsize=(7, 5))
+    plt.scatter(actual, pred, s=18, alpha=0.9)
+    m = min(min(actual), min(pred))
+    M = max(max(actual), max(pred))
+    plt.plot([m, M], [m, M], linestyle="--")
+    plt.xlabel("Actual waste (kg/week)")
+    plt.ylabel("Predicted waste (kg/week)")
+    plt.title("Actual vs Predicted — RandomForest")
+    plt.grid(True)
+    if save_path:
+        plt.savefig(save_path, bbox_inches="tight")
+    plt.show()
+
+
+def main():
+    # 1) Data
+    print("Generating synthetic data...")
+    df = generate_synthetic_data(n=1200)
+    csv_path = os.path.join(OUT_DIR, "ai_waste_synthetic.csv")
+    df.to_csv(csv_path, index=False)
+    print(f"Saved synthetic dataset to: {csv_path}")
+
+    # 2) Train/test split
+    features = ["household_count", "population_density", "avg_income",
+                "temperature", "day_of_week", "is_holiday",
+                "industrial_prop", "recycling_rate", "lat", "lon"]
+    X = df[features]
+    y = df["waste_volume_kg_per_week"]
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.20, random_state=RANDOM_STATE)
+
+    # 3) Train model (set tune=True to run RandomizedSearchCV)
+    print("Training model...")
+    model = train_model(X_train, y_train, tune=False)
+    joblib.dump(model, os.path.join(OUT_DIR, "rf_model.joblib"))
+    print("Model saved to output directory.")
+
+    # 4) Evaluate
+    eval_res = evaluate_model(model, X_test, y_test)
+    print(f"Model performance — RMSE: {eval_res['rmse']:.3f} kg/week, R^2: {eval_res['r2']:.3f}")
+
+    # 5) Clustering
+    print("Clustering locations into collection zones...")
+    df_clustered, centroids = cluster_locations(df, n_clusters=8)
+    csv_clustered = os.path.join(OUT_DIR, "ai_waste_synthetic_clustered.csv")
+    df_clustered.to_csv(csv_clustered, index=False)
+    print(f"Saved clustered data to: {csv_clustered}")
+
+    # 6) Routes per cluster (greedy NN)
+    print("Creating greedy routes per cluster (nearest neighbor heuristic)...")
+    routes = create_routes_per_cluster(df_clustered, take_top_n_per_cluster=200)
+    routes_path = os.path.join(OUT_DIR, "route_preview.json")
+    with open(routes_path, "w") as f:
+        json.dump(routes, f, indent=2)
+    print(f"Saved route preview to: {routes_path}")
+
+    # 7) Plots
+    print("Plotting...")
+    plot_clusters(df_clustered, centroids, save_path=os.path.join(OUT_DIR, "clusters.png"))
+    plot_actual_vs_pred(y_test.values, eval_res["y_pred"], save_path=os.path.join(OUT_DIR, "actual_vs_pred.png"))
+
+    # summary
+    cluster_counts = df_clustered["cluster"].value_counts().sort_index()
+    print("\nCluster sizes:")
+    print(cluster_counts.to_string())
+
+    print("\nOutputs:")
+    print(f" - Dataset: {csv_path}")
+    print(f" - Clustered dataset: {csv_clustered}")
+    print(f" - Route preview: {routes_path}")
+    print(f" - Saved model: {os.path.join(OUT_DIR, 'rf_model.joblib')}")
+    print("Done.")
+
+
+if __name__ == "__main__":
+    main()
